@@ -1,0 +1,386 @@
+
+---
+title: "R Notebook Neo4j Movie Graph Example for the neo4r package"
+output:
+  html_document:
+    code_folding: hide
+    number_sections: true
+    fig_height: 8
+    fig_width: 11
+    df_print: paged
+    theme: united
+    highlight: pygments
+    toc: true
+#    toc_float: true
+    toc_depth: 4
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r results='hide', warning=FALSE, message=FALSE}
+
+library(knitr)
+library(neo4r)
+library(tibble)
+library(dplyr)
+library(tidyverse)
+library(visNetwork)
+library(RColorBrewer)
+library(kableExtra)
+```
+# Setup Neo4j Environment {.tabset .tabset-fade}
+## Connect to Neo4j / Verify schema
+```{r neo4j-connection}
+neo4jServerURL <- "http://localhost:7474"
+neo4jUser <- "neo4j"
+neo4jPassword <- "admin"
+con <- neo4j_api$new(url = neo4jServerURL, user = neo4jUser, password = neo4jPassword)
+if (!is.null(con)) {
+  if (file_test('-f', '/.dockerenv')) {  # CK THIS - verify if you're in a docker container
+    print("Appear to be running in a docker container")
+    Sys.sleep(3)
+  }
+  if (con$ping() == 200) {
+    print(paste("Successfully connected to Neo4j version", con$get_version()))
+    if (!is.na(Sys.getenv("RSTUDIO", unset = NA)) && interactive() ) {
+      print("You are running in R Studio and can use Connections pane to browse schema.")
+      launch_con_pane(con)
+    }
+  } else {
+    cat(paste("Neo4j Server = ", neo4jServerURL, ", Neo4j User = ", neo4jUser, "\n"))
+  }
+}
+```
+## Validate movied DB
+```{r neo4j-Movie-Validation }
+requiredLabels <- tibble(labels = c("Person", "Movie"))
+requiredRelationships <-
+  tibble(labels = c("ACTED_IN", "DIRECTED", "PRODUCED", "WROTE","FOLLOWS","REVIEWED"))
+
+label_matches <-
+  nrow(inner_join(requiredLabels, con$get_labels(), by = 'labels')) - nrow(requiredLabels)
+relationship_matches <-
+  nrow(inner_join(requiredRelationships, con$get_relationships(), by = 'labels')) - nrow(requiredRelationships)
+
+if (label_matches == 0 && relationship_matches == 0) {
+  cat("Using database with data from the Neo4j movies graphgist\n")
+} else {
+  cat("Not using a database with the Movie Graph data!\nThe database is missing:\n")
+  if (label_matches != 0) {
+    cat("Node(s):\n")
+    print.data.frame(anti_join(labels, con$get_labels(), by = 'labels'))
+  }
+  if (relationship_matches != 0) {
+    cat("RELATIONSHIP(S):\n")
+    print.data.frame(anti_join(relationships, con$get_relationships(), by = 'labels'))
+  }
+  # send_cypher('https://raw.githubusercontent.com/dfgitn4j/Rmovies/master/create_movies.cypher', con = con)
+  # create movie graph database using the :play movies query
+  # Change this to deep linking into desktop? 
+  #   See https://medium.com/neo4j/neo4j-desktop-release-command-bar-security-deep-linking-be899d72b947 for how to use
+  cat("... creating the Movie Graph example data (you will need the apoc libraries installed) ...")
+  "CALL apoc.cypher.runFile('https://raw.githubusercontent.com/dfgitn4j/Rmovies/master/create_movies.cypher')" %>%
+    call_neo4j(con)
+}
+```
+## visNetwork & Utility Functions
+Utility functions
+
+- flatten property structures
+- unnest nodes & relationships
+
+Setup data structures
+
+- Assign consisent colors for each node
+- Assign what to use for a label
+
+Initialize a visNetwork display variable
+
+- General graph display function for nodes and edges
+
+### Utility Functions
+```{r visNetwork-neo4r-helper-functions}
+
+# Node and relationship structure returned by Neo4j is constant.
+# properties can be lists of lists
+flattenProperties <- function(props) {
+  prop_lists <- lapply(props, unlist, recursive=FALSE)    # get 1st level
+  prop_names <- unique(unlist(lapply(prop_lists, names)))
+  prop_lists <- lapply(prop_lists, function(x) {
+    y <- as.list(x)[prop_names]  # get values
+    names(y) <- prop_names       # add names
+    lapply(y, function(z) if(is.null(z)) NA else z)})
+  flatten_data <- lapply(prop_names, function(x) sapply(prop_lists, "[[", x))
+  names(flatten_data) <- as.list(prop_names)
+  data.frame(flatten_data, stringsAsFactors=FALSE)
+}
+  
+unnest_nodes2 <- function(nodes, what = c("all", "label", "properties")) {
+  what <- match.arg(what)
+  id_df <- tibble(id = nodes$id) # node id's
+  if (what %in% c('label', 'all') ) {
+    labels <- cbind(nodes[,c('id','label')])
+    if (what == 'label') { return(labels)}
+  } 
+  if (what %in% c('properties', 'all') ) {
+    properties<-cbind(id_df, flattenProperties(nodes$properties))
+    if (what == 'properties') { return(properties)}
+  } 
+  # what == 'all'
+  return(inner_join(labels, properties, by = 'id') )
+}
+
+unnest_relationships2 <- function(relationships, what = c("relationships", "properties", "all")) { 
+  what <- match.arg(what)
+  if (is.null(relationships)) {
+    edge_data <- NULL
+  } else {
+    id_df <- tibble(id = relationships$id)
+    if (what %in% c('relationships', 'all') ) {
+      rels<-select(relationships, id, startNode, endNode, type)
+      if (what == 'relationships') { return(rels) }
+    } 
+    if (what %in% c('properties', 'all') ){ 
+      props<-cbind(tibble(id = relationships$id), flattenProperties(relationships$properties))
+      if (what == 'properties') { return(props) }
+    }
+    return(inner_join(rels, props, by = "id"))
+  }
+}
+```
+### Visualization properties
+```{r graph-visualize-properties}
+# set constant colors for :Labels by visNetwork label value
+# put node count in actual_value
+# add text field to tell what property field to use for node display
+#  - is group (label) property name df
+q<-"CALL db.labels() yield label 
+      CALL apoc.cypher.run('match (:'+label+') return count(*) as count', null) YIELD value
+      RETURN label, value.count as count"  %>% call_neo4j(con, type="row")
+
+nodeVisuals<<-cbind.data.frame( q$label,
+                                color=colorRampPalette(brewer.pal(11,"Set3"))(nrow(q$label)), 
+                                stringsAsFactors = FALSE )
+nodeVisuals <- rename(nodeVisuals, label = value)  # change name from query name value to labels
+nodeVisuals$group<-nodeVisuals$label
+nodeVisuals$actual_value<-q$count$value
+nodeVisuals<-select(nodeVisuals, everything()) %>% 
+  left_join(tibble('group' = c('Movie', 'Person', 'Test'), 'text' = c('title',  'name', 'group')), by = 'group' )
+```
+### visNetwork utiity functions
+```{r visNetwork-utilities}
+# set groups for a visNetwork object based on labels
+setGroups <- function(g_disp, n_visuals, shape="circle") {
+  for (gr in n_visuals$label) {
+    g_disp<-visGroups(g_disp, groupname = gr, 
+                      color = n_visuals[n_visuals$label == gr,]$color,
+                      shape=shape,
+                      borderwidth=2)
+  }
+  return(g_disp)
+}
+# initialize a visNetwork structure
+setInitialGraph <- function(qry_graph_output, title = 'Graph', use_properties_for_label=FALSE) {
+  
+  node_data<<-unnest_nodes2(qry_graph_output$nodes)
+  edge_data<<-unnest_relationships2(qry_graph_output$relationships)
+   # adding color consistency and joining nodeVisuals for layout
+  node_data<-select(node_data, one_of(c('id', 'label'))) %>% 
+    unnest() %>% 
+    left_join(nodeVisuals, by = c('label' = 'group')) %>% 
+    rename( group = label) %>%
+    inner_join(node_data, by = 'id') %>% 
+    group_by(id) %>% mutate(gid = row_number()) %>% # add row nbr by grouped id's to take first label if there's more than one
+    filter(gid == 1) %>%
+    ungroup()  # grouping will add id column for select queries if left intact
+
+    #  using a property for display text as joined from nodeVisuals above, or group (Label) if there is not one defined
+  if (use_properties_for_label) { 
+    # label column is display text for nodes PUT IN is.na() test to return a default
+    node_data$text<-replace_na(node_data$text, 'group') # use group (neo4j :Label) if no text is defined to display in node
+    node_data$label<-apply(select_at(node_data, node_data$text), 1, function(x) na.omit(x)[1])  
+  } else { # use :Label for node text, e.g. Movie
+    node_data$label<-node_data$group
+  }
+  node_data$shadow<-TRUE
+  node_data$shape<-'circle'
+  
+  # rename startNode, endNode, and type for visNetwork
+  edge_data <- rename(edge_data, from = startNode, to = endNode, label = type)
+  edge_data$shadow = TRUE
+  edge_data$labelHighlightBold = TRUE
+  edge_data$arrows.to.scaleFactor = 2
+  edge_data$arrows = "to"
+  
+  return (graph_disp<-visNetwork(node_data, edge_data, width = "100%", main = title) %>%
+            visLayout(randomSeed = 100))
+}
+
+kableTable <- function(qry_res) {
+   # test to see if list of mutiple values
+  if ( reduce( (lapply(qry_res, function(x) { nrow(x)})), sum ) > 1 ) 
+    qry_res<-(map(qry_res, "value")) # return columns labeld value
+  qry_res %>%  # get rid of boolean 
+  as.data.frame() %>%
+  kable() %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE, position = "left")
+}
+```
+# Graph metadata {.tabset .tabset-fade}
+
+## Show colors assigned to node labels
+
+Display sizes nodes based on number of nodes in the graph
+```{r}
+# simple graph to display the consistent colors used for Neo4j node :Label(s) 
+# w
+
+disp_nodes <- nodeVisuals
+
+disp_nodes$shape<-'dot'  # circle would put label in node, but ignore value
+
+disp_nodes$size<-ifelse(disp_nodes$actual_value < 5, 5, disp_nodes$actual_value) # hard to hover w/ node size < 5
+disp_nodes$title<- apply(disp_nodes, 1, function(x) { paste0("<p>", x[['group']], " (", toString(x[['actual_value']]), " Nodes )</p>") })
+graph_disp<-visNetwork(disp_nodes, NULL, width = "100%", main = "Colors For Graph :Labels") 
+graph_disp<-setGroups(graph_disp, nodeVisuals, shape = 'square')
+graph_disp%>% visHierarchicalLayout(direction = "UD") %>% 
+  visInteraction(dragNodes = FALSE, dragView = FALSE, zoomView = FALSE) %>%
+  visLegend(zoom = FALSE) 
+```
+
+## Show movie graph structure 
+
+```{r}
+q<-"call db.schema()" %>% call_neo4j(con, type = 'graph') 
+disp_graph<-setInitialGraph(q, title = "Graph Metadata", use_properties_for_label = FALSE) 
+disp_graph %>% visPhysics(solver = 'barnesHut', 
+              barnesHut =  list(gravitationalConstant = -60000, centralGravity = 1, springLength = 150, springConstant = 0.05, avoidOverlap = 1))
+
+```
+
+# Movie Graph 
+
+Pop-cultural connections between actors and movies
+
+The Movie Graph is a mini graph application containing actors and directors that are related through the movies they've collaborated on.
+
+This guide will show you how to:
+
+1. Find: retrieve individual movies and actors
+2. Query: discover related actors and directors
+3. Solve: the Bacon Path
+
+## Find {.tabset .tabset-fade}
+### Find the actor named "Tom Hanks"...
+
+`MATCH (tom {name: 'Tom Hanks'}) RETURN tom`
+```{r find-tom-hanks}
+res<-"MATCH (tom {name: 'Tom Hanks'}) RETURN tom" %>% call_neo4j(con, type = 'row') 
+kableTable(res)
+#! NOT SURE why test column
+```
+### Find the movie with title "Cloud Atlas"...
+
+`MATCH (cloudAtlas {title: 'Cloud Atlas'}) RETURN cloudAtlas`
+```{r find-cloud-atlas}
+res<-"MATCH (cloudAtlas {title: 'Cloud Atlas'}) RETURN cloudAtlas" %>% call_neo4j(con, type = 'row') 
+kableTable(res)
+```
+### Find 10 people...
+
+`MATCH (people:Person) RETURN people.name,  people.born LIMIT 10`
+```{r find-10-people}
+res<-"MATCH (people:Person) RETURN people.name,  people.born LIMIT 10" %>% call_neo4j(con, type = 'row') 
+kableTable(res)
+```
+### Find movies released in the 1990s...
+
+`MATCH (nineties:Movie) WHERE nineties.released >= 1990 AND nineties.released < 2000 RETURN nineties.title`
+```{r 1990s-movies}
+res<-"MATCH (nineties:Movie) WHERE nineties.released >= 1990 AND nineties.released < 2000 RETURN nineties.title" %>% call_neo4j(con, type = 'row') 
+kableTable(res)
+```
+## Query {.tabset .tabset-fade}
+Finding patterns within the graph.
+
+1. Actors are people who acted in movies
+2. Directors are people who directed a movie
+3. What other relationships exist?
+
+### List all Tom Hanks movies...
+
+`MATCH p=(tom:Person {name: 'Tom Hanks'})-[:ACTED_IN]->(tomHanksMovies) RETURN p`
+```{r list-tom-hanks-movies}
+# original query does not return all the info needed for a visualization (automatically done by desktop)
+res<-"MATCH p=(tom:Person {name: 'Tom Hanks'})-[:ACTED_IN]->(tomHanksMovies) RETURN p" %>% call_neo4j(con, type = 'graph') 
+disp_graph<-setInitialGraph(res, title="Tom Hanks Movies", use_properties_for_label = TRUE)
+disp_graph %>% visPhysics(enabled = FALSE, solver = 'forceAtlas2Based', 
+           forceAtlas2Based = list(avoidOverlap = 0.75, gravitationalConstant=-100))
+```
+### Who directed "Cloud Atlas"?
+
+`MATCH (cloudAtlas {title: 'Cloud Atlas'})<-[:DIRECTED]-(directors) RETURN directors.name`
+```{r directed-cloud-atlas}
+res<-"MATCH (cloudAtlas {title: 'Cloud Atlas'})<-[:DIRECTED]-(directors) RETURN directors.name" %>% call_neo4j(con, type = 'row') 
+kableTable(res)
+```
+### Tom Hanks' co-actors...
+
+`MATCH (tom:Person {name: 'Tom Hanks'})-[:ACTED_IN]->(m)<-[:ACTED_IN]-(coActors) RETURN coActors.name`
+```{r tom-hanks-co-actors}
+res<-"MATCH (tom:Person {name: 'Tom Hanks'})-[:ACTED_IN]->(m)<-[:ACTED_IN]-(coActors) RETURN coActors.name" %>% 
+  call_neo4j(con, type = 'row') 
+kableTable(res)
+```
+### How people are related to "Cloud Atlas"...
+
+`MATCH (people:Person)-[relatedTo]-(:Movie {title: 'Cloud Atlas'}) RETURN people.name, Type(relatedTo), relatedTo`
+
+```{r related-to-cloud-atlas}
+#! DOES NOT WORK 
+# call_neo4j(con, type = 'row') below gives "Error in cbind_all(x) : Argument 3 must be length 1, not 4""
+res<-"MATCH (people:Person)-[relatedTo]-(:Movie {title: 'Cloud Atlas'}) RETURN people.name, Type(relatedTo), relatedTo" %>% 
+  call_neo4j(con, type = 'graph') 
+disp_graph<-setInitialGraph(res, title="People related to Cloud Atlas", use_properties_for_label = TRUE)
+disp_graph %>% visPhysics(enabled = FALSE, solver = 'forceAtlas2Based', 
+           forceAtlas2Based = list(avoidOverlap = 0.75, gravitationalConstant=-10000))
+```
+
+## Solve {.tabset .tabset-fade}
+You've heard of the classic "Six Degrees of Kevin Bacon"? That is simply a shortest path query called the "Bacon Path".
+
+1. Variable length patterns
+2. Built-in shortestPath() algorithm
+
+### Movies and actors up to 4 "hops" away from Kevin Bacon
+
+`MATCH p=(bacon:Person {name:'Kevin Bacon'})-[*1..4]-(hollywood) RETURN DISTINCT p`
+```{r 6-degrees-kevinB}
+res<-"MATCH p=(bacon:Person {name:'Kevin Bacon'})-[*1..4]-(hollywood) RETURN DISTINCT p"  %>% call_neo4j(con, type = 'graph')
+disp_graph<-setInitialGraph(res, title="Four 'Hops' From Kevin Bacon", use_properties_for_label = TRUE)
+where_is_kevinB<-match('Kevin Bacon', disp_graph$x$nodes$label)
+disp_graph$x$nodes$shape[where_is_kevinB]<-'box'
+disp_graph$x$nodes$color[where_is_kevinB]<-'#FF4141'
+disp_graph %>% visPhysics(enabled = FALSE, solver = 'forceAtlas2Based', 
+           forceAtlas2Based = list(avoidOverlap = 0.75, gravitationalConstant=-10000)) %>%
+  visOptions(highlightNearest = TRUE, selectedBy = "name") %>%
+  visInteraction(navigationButtons = TRUE)
+```
+
+### Bacon path, the shortest path of any relationships to Meg Ryan
+
+`MATCH p=shortestPath(
+  (bacon:Person {name:'Kevin Bacon'})-[*]-(meg:Person {name:'Meg Ryan'}))RETURN p`
+```{r shortest-path-kevin-meg}
+# original query does not return all the info needed for a visualization (automatically done by desktop)
+res<-"MATCH p=shortestPath(
+  (bacon:Person {name:'Kevin Bacon'})-[*]-(meg:Person {name:'Meg Ryan'}))RETURN p" %>% call_neo4j(con, type = 'graph') 
+disp_graph<-setInitialGraph(res, title="Shortest Path Between Kevin and Meg", use_properties_for_label = TRUE)
+where_is_kevinB<-match('Kevin Bacon', disp_graph$x$nodes$label)
+disp_graph$x$nodes$shape[where_is_kevinB]<-'box'
+disp_graph$x$nodes$color[where_is_kevinB]<-'#FF4141'
+disp_graph %>% visPhysics(enabled = FALSE, solver = 'forceAtlas2Based', 
+           forceAtlas2Based = list(avoidOverlap = 0.75, gravitationalConstant=-10000))
+```
