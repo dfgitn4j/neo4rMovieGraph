@@ -1,8 +1,7 @@
-
 ---
 title: "R Notebook Neo4j Movie Graph Example for the neo4r package"
 output:
-  html_document:
+  html_notebook:
     code_folding: hide
     number_sections: true
     fig_height: 8
