@@ -1,16 +1,19 @@
 ---
 title: "R Notebook Neo4j Movie Graph Example for the neo4r package"
 output:
+  html_document:
+    df_print: paged
+    toc: yes
+    toc_depth: '4'
   html_notebook:
     code_folding: hide
-    number_sections: true
+    df_print: paged
     fig_height: 8
     fig_width: 11
-    df_print: paged
-    theme: united
     highlight: pygments
-    toc: true
-#    toc_float: true
+    number_sections: yes
+    theme: united
+    toc: yes
     toc_depth: 4
 ---
 
@@ -69,11 +72,11 @@ if (label_matches == 0 && relationship_matches == 0) {
   cat("Not using a database with the Movie Graph data!\nThe database is missing:\n")
   if (label_matches != 0) {
     cat("Node(s):\n")
-    print.data.frame(anti_join(labels, con$get_labels(), by = 'labels'))
+    print.data.frame(anti_join(requiredLabels, con$get_labels(), by = 'labels'))
   }
   if (relationship_matches != 0) {
     cat("RELATIONSHIP(S):\n")
-    print.data.frame(anti_join(relationships, con$get_relationships(), by = 'labels'))
+    print.data.frame(anti_join(requiredRelationships, con$get_relationships(), by = 'labels'))
   }
   # send_cypher('https://raw.githubusercontent.com/dfgitn4j/Rmovies/master/create_movies.cypher', con = con)
   # create movie graph database using the :play movies query
