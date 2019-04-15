@@ -185,6 +185,8 @@ setInitialGraph <- function(qry_graph_output, title = 'Graph', use_properties_fo
   
   node_data<<-unnest_nodes2(qry_graph_output$nodes)
   edge_data<<-unnest_relationships2(qry_graph_output$relationships)
+  # node_data<<-unnest_nodes(qry_graph_output$nodes)
+  # edge_data<<-unnest_relationships(qry_graph_output$relationships)
    # adding color consistency and joining nodeVisuals for layout
   node_data<-select(node_data, one_of(c('id', 'label'))) %>% 
     unnest() %>% 
