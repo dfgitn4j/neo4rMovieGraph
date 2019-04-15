@@ -1,5 +1,11 @@
 ---
 title: "R Notebook Neo4j Movie Graph Example for the neo4r package"
+knit: (function(input_file, encoding) {
+ out_dir <- 'docs';
+ rmarkdown::render(input_file,
+ encoding=encoding,
+ output_file=file.path(dirname(input_file), out_dir, 'index.html'))
+ } )
 output:
   html_document:
     df_print: paged
@@ -87,22 +93,26 @@ if (label_matches == 0 && relationship_matches == 0) {
     call_neo4j(con)
 }
 ```
-## visNetwork & Utility Functions
+## Utility Functions
 Utility functions
+
+*neo4r helper functions*
 
 - flatten property structures
 - unnest nodes & relationships
+
+*visNetwork*
 
 Setup data structures
 
 - Assign consisent colors for each node
 - Assign what to use for a label
 
-Initialize a visNetwork display variable
+*Initialize a visNetwork display variable*
 
 - General graph display function for nodes and edges
 
-### Utility Functions
+### Neo4r Helper Functions
 ```{r visNetwork-neo4r-helper-functions}
 
 # Node and relationship structure returned by Neo4j is constant.
@@ -151,6 +161,7 @@ unnest_relationships2 <- function(relationships, what = c("relationships", "prop
     return(inner_join(rels, props, by = "id"))
   }
 }
+
 ```
 ### Visualization properties
 ```{r graph-visualize-properties}
@@ -171,6 +182,20 @@ nodeVisuals$actual_value<-q$count$value
 nodeVisuals<-select(nodeVisuals, everything()) %>% 
   left_join(tibble('group' = c('Movie', 'Person', 'Test'), 'text' = c('title',  'name', 'group')), by = 'group' )
 ```
+###Table output format functions
+```{r tableOutput-utilities}
+# use kable for nice formatting of table output
+kableTable <- function(qry_res) {
+   # test to see if list of mutiple values
+  if ( reduce( (lapply(qry_res, function(x) { nrow(x)})), sum ) > 1 ) 
+    qry_res<-(map(qry_res, "value")) # return columns labeld value
+  qry_res %>%  # get rid of boolean 
+  as.data.frame() %>%
+  kable() %>%
+  kable_styling(bootstrap_options = "striped", full_width = FALSE, position = "left")
+}
+
+```
 ### visNetwork utiity functions
 ```{r visNetwork-utilities}
 # set groups for a visNetwork object based on labels
@@ -183,6 +208,43 @@ setGroups <- function(g_disp, n_visuals, shape="circle") {
   }
   return(g_disp)
 }
+
+# rename startNode, endNode, and type for visNetwork
+visNetEdgeDisplayProps <- function (edge_df) {
+
+  edge_df <- rename(edge_df, from = startNode, to = endNode, label = type)
+  edge_df$shadow = TRUE
+  edge_df$labelHighlightBold = TRUE
+  edge_df$arrows.to.scaleFactor = 2
+  edge_df$arrows = "to"
+  
+  return(edge_df)
+}
+
+# adding color consistency and joining nodeVisuals for layout
+visNetworkNodeDisplayProps <- function(node_df, use_props) {
+  node_df<-select(node_df, one_of(c('id', 'label'))) %>% 
+    unnest() %>% 
+    left_join(nodeVisuals, by = c('label' = 'group')) %>% 
+    rename( group = label) %>%
+    inner_join(node_df, by = 'id') %>% 
+    group_by(id) %>% mutate(gid = row_number()) %>% # add row nbr by grouped id's to take first label if there's more than one
+    filter(gid == 1) %>%
+    ungroup()  # grouping will add id column for select queries if left intact
+
+    #  using a property for display text as joined from nodeVisuals above, or group (Label) if there is not one defined
+  if (use_props) { 
+    # label column is display text for nodes PUT IN is.na() test to return a default
+    node_df$text<-replace_na(node_df$text, 'group') # use group (neo4j :Label) if no text is defined to display in node
+    node_df$label<-apply(select_at(node_df, node_df$text), 1, function(x) na.omit(x)[1])  
+  } else { # use :Label for node text, e.g. Movie
+    node_df$label<-node_df$group
+  }
+  node_df$shadow<-TRUE
+  node_df$shape<-'circle'
+  
+  return(node_df)
+}
 # initialize a visNetwork structure
 setInitialGraph <- function(qry_graph_output, title = 'Graph', use_properties_for_label=FALSE) {
   
@@ -190,47 +252,14 @@ setInitialGraph <- function(qry_graph_output, title = 'Graph', use_properties_fo
   edge_data<<-unnest_relationships2(qry_graph_output$relationships)
   # node_data<<-unnest_nodes(qry_graph_output$nodes)
   # edge_data<<-unnest_relationships(qry_graph_output$relationships)
-   # adding color consistency and joining nodeVisuals for layout
-  node_data<-select(node_data, one_of(c('id', 'label'))) %>% 
-    unnest() %>% 
-    left_join(nodeVisuals, by = c('label' = 'group')) %>% 
-    rename( group = label) %>%
-    inner_join(node_data, by = 'id') %>% 
-    group_by(id) %>% mutate(gid = row_number()) %>% # add row nbr by grouped id's to take first label if there's more than one
-    filter(gid == 1) %>%
-    ungroup()  # grouping will add id column for select queries if left intact
 
-    #  using a property for display text as joined from nodeVisuals above, or group (Label) if there is not one defined
-  if (use_properties_for_label) { 
-    # label column is display text for nodes PUT IN is.na() test to return a default
-    node_data$text<-replace_na(node_data$text, 'group') # use group (neo4j :Label) if no text is defined to display in node
-    node_data$label<-apply(select_at(node_data, node_data$text), 1, function(x) na.omit(x)[1])  
-  } else { # use :Label for node text, e.g. Movie
-    node_data$label<-node_data$group
-  }
-  node_data$shadow<-TRUE
-  node_data$shape<-'circle'
-  
-  # rename startNode, endNode, and type for visNetwork
-  edge_data <- rename(edge_data, from = startNode, to = endNode, label = type)
-  edge_data$shadow = TRUE
-  edge_data$labelHighlightBold = TRUE
-  edge_data$arrows.to.scaleFactor = 2
-  edge_data$arrows = "to"
+  node_data<-visNetworkNodeDisplayProps(node_data, use_properties_for_label)
+  edge_data<-visNetEdgeDisplayProps(edge_data)
   
   return (graph_disp<-visNetwork(node_data, edge_data, width = "100%", main = title) %>%
             visLayout(randomSeed = 100))
 }
 
-kableTable <- function(qry_res) {
-   # test to see if list of mutiple values
-  if ( reduce( (lapply(qry_res, function(x) { nrow(x)})), sum ) > 1 ) 
-    qry_res<-(map(qry_res, "value")) # return columns labeld value
-  qry_res %>%  # get rid of boolean 
-  as.data.frame() %>%
-  kable() %>%
-  kable_styling(bootstrap_options = "striped", full_width = FALSE, position = "left")
-}
 ```
 # Graph metadata {.tabset .tabset-fade}
 
